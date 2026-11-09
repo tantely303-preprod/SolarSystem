@@ -30137,6 +30137,200 @@ updatePositions = function () {
 
 console.log('[FIX v17] Vaisseaux suivent leur corps (preflight→origin · done→target) · tick arrière-plan permanent');
 
+/* ============================================================
+   🔧 FIX v17 — Permalink : voyages sauvegardés/restaurés
+   ============================================================ */
+
+/* ─── [1] Sérialisation ─── */
+function spSerializeTravel(inst, isActive) {
+  const v = inst.vessel || { x: 0, y: 0, z: 0 };
+  const id = inst.id || inst.listId || '';
+  const oName = inst.origin ? inst.origin.name : '';
+  const tName = inst.target ? inst.target.name : '';
+  const vName = (inst.vessel && inst.vessel.name) || '';
+  return [
+    (isActive ? '*' : '') + id,
+    oName, tName, vName,
+    inst.departYear || 2000,
+    (inst.travelDays || 1).toFixed(4),
+    inst.phase || 'pending',
+    (inst.progress || 0).toFixed(4),
+    inst.paused ? 1 : 0,
+    inst.musicMuted ? 1 : 0,
+    v.x.toFixed(3), v.y.toFixed(3), v.z.toFixed(3)
+  ].join('|');
+}
+
+function spSerializeTravels() {
+  if (typeof TRAVEL_INSTANCES === 'undefined' || !TRAVEL_INSTANCES.size) return '';
+  const parts = [];
+  const seen = new Set();
+
+  if (ACTIVE_TRAVEL_ID && TRAVEL_INSTANCES.has(ACTIVE_TRAVEL_ID)) {
+    parts.push(spSerializeTravel(TRAVEL_INSTANCES.get(ACTIVE_TRAVEL_ID), true));
+    seen.add(ACTIVE_TRAVEL_ID);
+  }
+
+  let count = 0;
+  for (const [id, inst] of TRAVEL_INSTANCES) {
+    if (seen.has(id)) continue;
+    if (count++ >= 20) break;
+    parts.push(spSerializeTravel(inst, false));
+  }
+  return parts.join(';');
+}
+
+/* ─── [2] Désérialisation ─── */
+function spApplyTravelsParam(param) {
+  if (!param) return;
+  const parts = String(param).split(';');
+  let activeId = null;
+
+  for (const raw of parts) {
+    if (!raw) continue;
+    let part = raw;
+    let isActive = false;
+    if (part.startsWith('*')) { isActive = true; part = part.slice(1); }
+
+    const f = part.split('|');
+    if (f.length < 13) continue;
+
+    const id = f[0];
+    const originName = f[1];
+    const targetName = f[2];
+    const vesselName = f[3];
+    const departYear = parseInt(f[4], 10) || 2000;
+    const travelDays = parseFloat(f[5]) || 1;
+    const phase = f[6] || 'pending';
+    const progress = Math.max(0, Math.min(1, parseFloat(f[7]) || 0));
+    const paused = f[8] === '1';
+    const musicMuted = f[9] === '1';
+    const vx = parseFloat(f[10]) || 0;
+    const vy = parseFloat(f[11]) || 0;
+    const vz = parseFloat(f[12]) || 0;
+
+    const origin = findBodyByName(originName);
+    const target = findBodyByName(targetName);
+    if (!origin || !target) continue;
+
+    /* Recalcul du vrai chrono pour préserver progress à l'instant T */
+    const realDuration = Math.max(45000, Math.min(240000, travelDays * 0.3 * 1000 + 30000));
+    const now = performance.now();
+    const realStart = now - progress * realDuration;
+
+    const vessel = {
+      name: vesselName || 'Vaisseau',
+      kind: 'ship', type: 'shuttle',
+      x: vx, y: vy, z: vz,
+      r: 0.8, color: '#88ddff',
+      _isCivicTravel: true,
+      origin: originName, destination: targetName
+    };
+
+    const msg = {
+      id, isCivicRequest: true,
+      civicMeta: {
+        homeBody: originName, targetBody: targetName,
+        vesselName, departYear, vesselSpeed: 25
+      }
+    };
+
+    const inst = {
+      id, listId: id, msg,
+      meta: msg.civicMeta,
+      origin, target, vessel,
+      departYear, travelDays,
+      realStart, realDuration,
+      progress, phase, paused, musicMuted,
+      milestonesFired: new Set(),
+      trail: [[vx, vy, vz]],
+      _p0: null, _p1: null,
+      _tooltipDetached: false,
+      preflightDone: (phase === 'journey' || phase === 'arrive' || phase === 'done'),
+      preflightStepsDone: new Set(),
+      welcomeSpoken: false,
+      countdownScheduled: false
+    };
+
+    /* Pré-vol : marquer les étapes passées si phase > pending */
+    if (phase === 'preflight') {
+      inst.preflightStart = now;
+      inst.preflightStepsDone.add('cam0');
+      inst.preflightStepsDone.add('surface');
+    }
+
+    TRAVEL_INSTANCES.set(id, inst);
+    if (isActive) activeId = id;
+  }
+
+  /* Activer le voyage marqué actif */
+  if (activeId && TRAVEL_INSTANCES.has(activeId)) {
+    ACTIVE_TRAVEL_ID = activeId;
+    const inst = TRAVEL_INSTANCES.get(activeId);
+    for (const k of Object.keys(TRAVEL_SCENARIO)) delete TRAVEL_SCENARIO[k];
+    Object.assign(TRAVEL_SCENARIO, inst);
+    TRAVEL_SCENARIO.active = (inst.phase !== 'done');
+    TRAVEL_SCENARIO.listId = inst.listId;
+
+    if (inst.phase !== 'done') {
+      setTimeout(() => {
+        try {
+          spShowTravelOverlay();
+          spUpdateTravelOverlay();
+        } catch (e) {}
+      }, 600);
+    }
+  }
+
+  /* Démarrer les pré-vols restés en pending */
+  setTimeout(() => {
+    for (const [id, inst] of TRAVEL_INSTANCES) {
+      if (inst.phase === 'pending' && typeof spStartPreflightForInstance === 'function') {
+        try { spStartPreflightForInstance(inst); } catch (e) {}
+      }
+    }
+  }, 500);
+
+  /* Rafraîchir l'UI */
+  setTimeout(() => {
+    try { if (typeof spUpdateTravelMgrBadgeCount === 'function') spUpdateTravelMgrBadgeCount(); } catch (e) {}
+  }, 800);
+}
+
+/* ─── [3] Hook collectPermalink ─── */
+const _prevCollectPermalinkV17 = collectPermalink;
+collectPermalink = function () {
+  const str = _prevCollectPermalinkV17.call(this);
+  const p = new URLSearchParams(str);
+  try {
+    const trav = spSerializeTravels();
+    if (trav) p.set('trav', trav);
+    if (ACTIVE_TRAVEL_ID) p.set('travAct', ACTIVE_TRAVEL_ID);
+  } catch (e) { console.warn('[v17 collect]', e); }
+  return p.toString();
+};
+
+/* ─── [4] Hook applyStateFromURL ─── */
+const _prevApplyStateV17 = applyStateFromURL;
+applyStateFromURL = function () {
+  _prevApplyStateV17.call(this);
+  const params = new URLSearchParams(location.search);
+  const trav = params.get('trav');
+  if (trav) {
+    try { spApplyTravelsParam(trav); }
+    catch (e) { console.warn('[v17 apply]', e); }
+  }
+};
+
+/* ─── [5] Ré-applique au chargement ─── */
+if (location.search.length > 1 && location.search.includes('trav=')) {
+  setTimeout(() => {
+    try { applyStateFromURL(); } catch (e) { console.warn('[v17 reload]', e); }
+  }, 800);
+}
+
+console.log('[FIX v17] Permalink : voyages sauvegardés (trav / travAct) · progress restaurée');
+
 })();
 </script>
 
